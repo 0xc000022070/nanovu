@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/engine", "crates/api", "crates/inbox", "crates/nanovu"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[workspace.dependencies]
+nanovu-core = { path = "crates/core" }
+nanovu-engine = { path = "crates/engine" }
+nanovu-api = { path = "crates/api" }
+nanovu-inbox = { path = "crates/inbox" }
+
+async-trait = "0.1.92"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+getrandom = "0.4.3"
+hex = "0.4.3"
+hmac = "0.13.0"
+jiff = { version = "1.0.1", default-features = false, features = ["std"] }
+jsonwebtoken = { version = "12.0.0", default-features = false, features = ["use_pem", "rust_crypto"] }
+lettre = { version = "0.11.24", default-features = false, features = ["builder", "ring", "rustls-platform-verifier", "smtp-transport", "tokio1-rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.11.1"
+sqlx = { version = "0.9.1", default-features = false, features = ["sqlite-bundled", "runtime-tokio"] }
+subtle = "2.6.1"
+tokio = { version = "1.54.1", default-features = false }
+toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
+tower = { version = "0.5.3", default-features = false }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

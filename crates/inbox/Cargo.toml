@@ -1,0 +1,23 @@
+[package]
+name = "nanovu-inbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true, features = ["ws"] }
+nanovu-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "time", "test-util"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true
