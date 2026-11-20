@@ -98,7 +98,8 @@ from = "Cuenta Cero <no-reply@example.com>"
 - CLI: `nanovu serve --config <path>`, `nanovu check --config <path>` (validates config,
   secret files readable and not world-readable, prints environment ids, never secrets),
   `nanovu hash --config <path> --env <name> <subscriberId>` (debug helper).
-- Startup refuses: no environments, missing, empty or group/world-readable secret files,
+- Startup refuses: no environments, missing, empty, world-readable or non-root-group-readable
+  secret files (systemd credentials are root:root 0440),
   duplicate `application_identifier`, duplicate secret keys, secret key shorter than 32 chars,
   more than one smtp integration in an environment (each would send every email), unknown
   config keys.

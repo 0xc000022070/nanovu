@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -164,9 +164,10 @@ impl Config {
 fn read_secret(path: &Path) -> Result<Secret, ConfigError> {
     let meta = std::fs::metadata(path)
         .or_else(|e| fail(format!("secret file {}: {e}", path.display())))?;
-    if meta.permissions().mode() & 0o044 != 0 {
+    let mode = meta.permissions().mode();
+    if mode & 0o004 != 0 || (mode & 0o040 != 0 && meta.gid() != 0) {
         return fail(format!(
-            "secret file {} is readable by group or others (chmod 0400 or 0600)",
+            "secret file {} is readable by others or a non-root group (chmod 0400 or 0600)",
             path.display()
         ));
     }
@@ -263,7 +264,7 @@ pub(crate) mod tests {
             (db.to_string(), "no environments"),
             (
                 format!("{db}{}", env_stanza("x", "app", &open)),
-                "readable by group",
+                "non-root group",
             ),
             (
                 format!("{db}{}", env_stanza("x", "app", &dir.0.join("missing"))),
