@@ -1,16 +1,16 @@
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Request, State};
-use axum::http::{HeaderMap, StatusCode, header, request::Parts};
+use axum::http::{HeaderMap, StatusCode, Uri, header, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use nanovu_core::domain::{
-    Channel, Mark, Message, MessageQuery, Subscriber, SubscriberPatch, Topic, TopicMember,
-    TopicSubscriptions,
+    Channel, Mark, Message, MessageQuery, Subscriber, SubscriberPatch, SubscriberUpdate, Topic,
+    TopicMember, TopicSubscriptions,
 };
 use nanovu_core::{AppState, Environment, Event, HttpError, Id, JsonBody, QueryParams, time};
 use nanovu_engine::{Engine, Recipient, TriggerRequest};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
 const MAX_BATCH: usize = 100;
@@ -165,8 +165,35 @@ impl SubscriberBody {
     }
 }
 
+fn nullable<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscriberUpdateBody {
+    #[serde(default, deserialize_with = "nullable")]
+    email: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    first_name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    last_name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    phone: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    avatar: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    locale: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    timezone: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    data: Option<Option<Map<String, Value>>>,
+}
+
 fn subscriber_dto(env: &Id, s: &Subscriber) -> Value {
-    json!({
+    let mut dto = json!({
         "_id": s.id,
         "subscriberId": s.subscriber_id,
         "_organizationId": env,
@@ -182,7 +209,11 @@ fn subscriber_dto(env: &Id, s: &Subscriber) -> Value {
         "deleted": false,
         "createdAt": time::iso(s.created_at),
         "updatedAt": time::iso(s.updated_at),
-    })
+    });
+    if let Value::Object(fields) = &mut dto {
+        fields.retain(|_, v| !v.is_null());
+    }
+    dto
 }
 
 async fn create_subscriber(
@@ -205,14 +236,23 @@ async fn update_subscriber(
     State(ctx): State<Ctx>,
     caller: Caller,
     Path(subscriber_id): Path<String>,
-    JsonBody(payload): JsonBody<SubscriberBody>,
+    JsonBody(payload): JsonBody<SubscriberUpdateBody>,
 ) -> Reply {
     let env = caller.environment(&ctx.state)?;
-    let (_, patch) = payload.into_parts();
+    let update = SubscriberUpdate {
+        email: payload.email,
+        first_name: payload.first_name,
+        last_name: payload.last_name,
+        phone: payload.phone,
+        avatar: payload.avatar,
+        locale: payload.locale,
+        timezone: payload.timezone,
+        data: payload.data.map(|data| data.map(Value::Object)),
+    };
     let subscriber = ctx
         .state
         .store
-        .update_subscriber(&env.id, &subscriber_id, &patch)
+        .update_subscriber(&env.id, &subscriber_id, &update)
         .await?
         .ok_or_else(|| HttpError::not_found("Subscriber not found"))?;
     data(StatusCode::OK, subscriber_dto(&env.id, &subscriber))
@@ -387,6 +427,7 @@ impl SubscriptionsBody {
 
 fn subscriptions_reply(
     status: StatusCode,
+    path: &str,
     requested: usize,
     result: &TopicSubscriptions,
     missing_code: &str,
@@ -424,7 +465,7 @@ fn subscriptions_reply(
             })
         })
         .collect();
-    let body = json!({
+    let mut body = json!({
         "data": data,
         "meta": {
             "totalCount": requested,
@@ -433,12 +474,23 @@ fn subscriptions_reply(
         },
         "errors": errors,
     });
+    if result.subscriptions.is_empty() && !result.missing.is_empty() {
+        // Upstream's exception filter sends the result both flat and under `ctx`;
+        // the SDK's ErrorDto keeps only `ctx`.
+        body["ctx"] = body.clone();
+        body["statusCode"] = json!(400);
+        body["timestamp"] = json!(time::iso(time::now_ms()));
+        body["path"] = json!(path);
+        body["message"] = json!("Api Exception Raised with status 400");
+        return Ok((StatusCode::BAD_REQUEST, Json(body)));
+    }
     Ok((status, Json(body)))
 }
 
 async fn subscribe(
     State(ctx): State<Ctx>,
     caller: Caller,
+    uri: Uri,
     Path(key): Path<String>,
     JsonBody(payload): JsonBody<SubscriptionsBody>,
 ) -> Reply {
@@ -451,6 +503,7 @@ async fn subscribe(
         .await?;
     subscriptions_reply(
         StatusCode::CREATED,
+        uri.path(),
         members.len(),
         &result,
         "SUBSCRIBER_NOT_FOUND",
@@ -460,6 +513,7 @@ async fn subscribe(
 async fn unsubscribe(
     State(ctx): State<Ctx>,
     caller: Caller,
+    uri: Uri,
     Path(key): Path<String>,
     JsonBody(payload): JsonBody<SubscriptionsBody>,
 ) -> Reply {
@@ -477,6 +531,7 @@ async fn unsubscribe(
         .ok_or_else(|| HttpError::not_found("Topic not found"))?;
     subscriptions_reply(
         StatusCode::OK,
+        uri.path(),
         subscriber_ids.len(),
         &result,
         "SUBSCRIPTION_NOT_FOUND",
@@ -574,9 +629,13 @@ async fn mark_messages(
         MarkAs::Unread => Mark::Unread,
         MarkAs::Unseen => Mark::Unseen,
     };
-    let messages = ctx
-        .state
-        .store
+    let store = &ctx.state.store;
+    if store.subscriber(&env.id, &subscriber_id).await?.is_none() {
+        return Err(HttpError::not_found(format!(
+            "Subscriber {subscriber_id} not found"
+        )));
+    }
+    let messages = store
         .mark_messages(&env.id, &subscriber_id, &ids, mark)
         .await?;
     if !messages.is_empty() {
@@ -588,6 +647,11 @@ async fn mark_messages(
         StatusCode::CREATED,
         messages.iter().map(|m| message_dto(&env.id, m)).collect(),
     )
+}
+
+fn channel(value: &str) -> Result<Channel, HttpError> {
+    Channel::parse(value)
+        .ok_or_else(|| HttpError::bad_request("channel must be one of in_app, email, push"))
 }
 
 fn message_query(pairs: Vec<(String, String)>) -> Result<MessageQuery, HttpError> {
@@ -606,9 +670,7 @@ fn message_query(pairs: Vec<(String, String)>) -> Result<MessageQuery, HttpError
         } else if key == "transactionId" {
             query.transaction_ids.push(value);
         } else if key == "channel" {
-            query.channel = Some(Channel::parse(&value).ok_or_else(|| {
-                HttpError::bad_request("channel must be one of in_app, email, push")
-            })?);
+            query.channel = Some(channel(&value)?);
         } else if key == "page" {
             query.page = number(&key, &value)?;
         } else if key == "limit" {
@@ -625,7 +687,15 @@ async fn list_messages(
 ) -> Reply {
     let env = caller.environment(&ctx.state)?;
     let query = message_query(pairs)?;
-    let (messages, has_more) = ctx.state.store.messages(&env.id, &query).await?;
+    let store = &ctx.state.store;
+    if let Some(id) = &query.subscriber_id
+        && store.subscriber(&env.id, id).await?.is_none()
+    {
+        return Err(HttpError::not_found(format!(
+            "Subscriber '{id}' was not found"
+        )));
+    }
+    let (messages, has_more) = store.messages(&env.id, &query).await?;
     let data: Vec<Value> = messages.iter().map(|m| message_dto(&env.id, m)).collect();
     let body = json!({
         "hasMore": has_more,
@@ -636,16 +706,23 @@ async fn list_messages(
     Ok((StatusCode::OK, Json(body)))
 }
 
+#[derive(Deserialize)]
+struct DeleteTransactionQuery {
+    channel: Option<String>,
+}
+
 async fn delete_transaction(
     State(ctx): State<Ctx>,
     caller: Caller,
     Path(transaction_id): Path<String>,
+    QueryParams(query): QueryParams<DeleteTransactionQuery>,
 ) -> Result<StatusCode, HttpError> {
     let env = caller.environment(&ctx.state)?;
+    let channel = query.channel.as_deref().map(channel).transpose()?;
     let mut subscribers = ctx
         .state
         .store
-        .delete_transaction_messages(&env.id, &transaction_id)
+        .delete_transaction_messages(&env.id, &transaction_id, channel)
         .await?;
     subscribers.sort();
     subscribers.dedup();
@@ -664,6 +741,8 @@ enum Target {
     Topic {
         #[serde(rename = "topicKey")]
         topic_key: String,
+        #[serde(default)]
+        exclude: Vec<String>,
     },
     Subscriber(Box<SubscriberBody>),
 }
@@ -690,8 +769,9 @@ fn trigger_request(request: TriggerBody, headers: &HeaderMap) -> Result<TriggerR
                 subscriber_id: required(Some(id), "subscriberId")?,
                 patch: Box::default(),
             }),
-            Target::Topic { topic_key } => Ok(Recipient::Topic {
+            Target::Topic { topic_key, exclude } => Ok(Recipient::Topic {
                 key: required(Some(topic_key), "topicKey")?,
+                exclude,
             }),
             Target::Subscriber(subscriber) => {
                 let (id, patch) = subscriber.into_parts();
@@ -1275,7 +1355,7 @@ mod tests {
         let request = parse_trigger(
             json!({
                 "name": "wf",
-                "to": ["s1", {"subscriberId": "s2", "email": "a@b.c", "data": {"k": 1}}, {"type": "Topic", "topicKey": "t"}],
+                "to": ["s1", {"subscriberId": "s2", "email": "a@b.c", "data": {"k": 1}}, {"type": "Topic", "topicKey": "t", "exclude": ["s3"]}],
                 "actor": {"subscriberId": "boss"},
                 "transactionId": "tx",
                 "bridgeUrl": "http://localhost/api/novu",
@@ -1304,7 +1384,10 @@ mod tests {
                         ..SubscriberPatch::default()
                     }),
                 },
-                Recipient::Topic { key: "t".into() },
+                Recipient::Topic {
+                    key: "t".into(),
+                    exclude: vec!["s3".into()],
+                },
             ]
         );
 

@@ -154,18 +154,18 @@ without re-triggering).
 | route | notes |
 | --- | --- |
 | `POST /v1/bridge/sync` | body `{bridgeUrl}`. GET `<bridgeUrl>?action=discover` (signed), replace this environment's workflows with the result, delete the ones missing. Response `{data:[...workflows]}` (caller reads `.data.length`). No workflow count limit. |
-| `POST /v1/events/trigger` | body `{name, to, payload, transactionId?, actor?, bridgeUrl?}`. `to` is one or an array (max 100) of: `"id"`, `{subscriberId, email?, ...}`, `{type:"Topic", topicKey}`; more than 2000 subscribers after expansion is 400. 201 `{data:{acknowledged:true, status:"processed", transactionId}}`. Unknown workflow 422. Payload failing the workflow's JSON schema 400. Processing is asynchronous. A `transactionId` that already has messages or runs that were not cancelled is acknowledged the same way and dropped (as upstream); deleting its messages releases it. |
+| `POST /v1/events/trigger` | body `{name, to, payload, transactionId?, actor?, bridgeUrl?}`. `to` is one or an array (max 100) of: `"id"`, `{subscriberId, email?, ...}`, `{type:"Topic", topicKey, exclude?}`; `exclude` (and `actor`) drop subscribers from that topic's expansion only, a subscriber also addressed directly is still notified; more than 2000 subscribers after expansion is 400. 201 `{data:{acknowledged:true, status:"processed", transactionId}}`. Unknown workflow 422. Payload failing the workflow's JSON schema 400; as in the framework, properties outside the schema and missing required ones that have a `default` do not fail. Processing is asynchronous. A `transactionId` that already has messages or runs that were not cancelled is acknowledged the same way and dropped (as upstream); deleting its messages releases it. |
 | `DELETE /v1/events/trigger/:transactionId` | cancels pending jobs of that transaction. 200 `{data:true|false}`. |
 | `POST /v2/subscribers` | upsert `{subscriberId, email?, locale?, firstName?, lastName?, phone?, avatar?, timezone?, data?}`. 201 subscriber DTO. `failIfExists` is ignored (its 409 is retried by the SDK); null fields leave stored values untouched. |
-| `PATCH /v2/subscribers/:id` | partial update. 200 subscriber DTO. 404 when missing. |
+| `PATCH /v2/subscribers/:id` | partial update: an absent field is left, `null` clears it. 200 subscriber DTO. 404 when missing. |
 | `DELETE /v2/subscribers/:id` | removes subscriber, tokens, preferences, topic memberships, messages, runs and their digest events, and closes the subscriber's WebSockets. 200 `{data:{acknowledged:true,status:"deleted"}}`. 404 when missing. |
 | `PUT /v1/subscribers/:id/credentials` | body `{providerId, integrationIdentifier?, credentials:{deviceTokens:[...]}}`. Replaces the token set (max 100). 200 subscriber DTO. When the environment has no integration for that provider (or identifier), 400 (as upstream) with message exactly `Subscribers environment (<envId>) do not have active <providerId> integration.` Unknown subscriber 400 `SubscriberId: <id> not found`. |
 | `POST /v2/topics` | `{key, name?}` upsert. 201 `{data:{_id, key, name?, createdAt, updatedAt}}` (`name` omitted when unset: the SDK rejects null). |
 | `POST /v2/topics/:key/subscriptions` | `{subscriptions:[{identifier, subscriberId}]}` (also accept plain `subscriberIds`). Entries may be plain subscriber ids; a missing `identifier` defaults to upstream's `tk_<key>:si_<subscriberId>`. Max 100. Creates the topic when missing. 201 `{data:[{_id, identifier, topic, subscriber, createdAt, updatedAt}], meta:{totalCount, successful, failed}, errors:[{subscriberId, code:"SUBSCRIBER_NOT_FOUND", message}]}` (not unwrapped: two keys). |
-| `DELETE /v2/topics/:key/subscriptions` | same body and response, 200. Removal is by `subscriberId`; an entry with only `identifier` is 400. Unknown topic 404. |
-| `POST /v1/subscribers/:id/messages/mark-as` | `{messageId: string | string[], markAs: "read"|"unread"|"seen"|"unseen"}`. Max 100 ids; ids that do not parse are dropped, none left is 400. 201 `{data: MessageResponseDto[]}`. Pushes realtime count events. |
-| `GET /v1/messages` | query `subscriberId`, `transactionId` (repeated key: the SDK explodes arrays), `channel`, `page` (zero-based), `limit` (default 10, max 1000). `{data:[...], hasMore, pageSize, page}`. |
-| `DELETE /v1/messages/transaction/:transactionId` | deletes messages and finished runs of that transaction (so the id can be triggered again), pushes realtime count events. 204. |
+| `DELETE /v2/topics/:key/subscriptions` | same body and response, 200. Removal is by `subscriberId`; an entry with only `identifier` is 400. Unknown topic 404. On either route, when every entry fails the status is 400 with the same body plus `statusCode, timestamp, path, message` and the body again under `ctx` (upstream's error filter); `@novu/api` throws `ErrorDto` with `ctx.meta`/`ctx.errors`. |
+| `POST /v1/subscribers/:id/messages/mark-as` | `{messageId: string | string[], markAs: "read"|"unread"|"seen"|"unseen"}`. Max 100 ids; ids that do not parse are dropped, none left is 400. `unseen` clears only seen. Unknown subscriber 404. 201 `{data: MessageResponseDto[]}`. Pushes realtime count events. |
+| `GET /v1/messages` | query `subscriberId`, `transactionId` (repeated key: the SDK explodes arrays), `channel`, `page` (zero-based), `limit` (default 10, max 1000). `{data:[...], hasMore, pageSize, page}`. Unknown `subscriberId` 404. |
+| `DELETE /v1/messages/transaction/:transactionId` | query `channel?` limits the delete to that channel (unknown channel 400). Deletes messages, then the finished runs of that transaction once none of its messages remain (so the id can be triggered again), pushes realtime count events. 204, also when nothing matches. |
 
 Wire names carry underscores (`_id`, `_organizationId`, `_environmentId`); the SDK remaps them.
 Subscriber DTO needs at least `subscriberId, _organizationId, _environmentId, deleted,
@@ -182,10 +182,12 @@ with JSON `{message}`. CORS: allow any origin, no credentials.
 | route | notes |
 | --- | --- |
 | `POST /v1/inbox/session` | `{applicationIdentifier, subscriberHash, subscriber:{subscriberId, timezone?, ...}}` (legacy top-level `subscriberId` too). Creates the subscriber when missing and sets `timezone`/`locale`; other fields are ignored. 201 `{data:{token, totalUnreadCount, unreadCount:{total, severity:{high, medium, low, none}}, removeNovuBranding:true, isDevelopmentMode:false, maxSnoozeDurationHours:0, applicationIdentifier, contextKeys:[]}}`. Unknown application identifier: 400. Bad or missing hash: 401. |
-| `GET /v1/inbox/notifications` | query `limit` (default 10, max 100), `after` (id cursor), `offset`, `tags[]`, `read`, `archived`, `snoozed`, `seen`, `data` (JSON object, all keys must match), `severity[]` or `severity`. `createdGte`/`createdLte` answer 400 (not implemented). `{data:[InboxNotification], hasMore, filter}`; `filter` echoes the given filter fields. Newest first. |
+| `GET /v1/inbox/notifications` | query `limit` (default 10, max 100), `after` (id cursor), `offset`, `tags[]` (one OR group) or `tags[i][]` (the SDK's form of `{and:[{or}]}`, echoed in that object form), `read`, `archived`, `snoozed`, `seen`, `data`, `severity[]` or `severity`. `createdGte`/`createdLte` answer 400 (not implemented). `{data:[InboxNotification], hasMore, filter}`; `filter` echoes the given filter fields. Newest first. |
 | `GET /v1/inbox/notifications/count` | query `filters=<JSON array of filters>`, at most 30 (400 above). `{data:[{count, filter}]}`. Echo each filter exactly as received: the SDK matches with strict equality, so no added keys and no nulls. |
+| filter `tags` | `string[]` (one OR group), `{or: string[]}` or `{and: [{or: string[]}]}` (every group shares a tag with the message). At most 30 groups, 100 tags per group, 200 in total; an empty `and` entry is 400. |
+| filter `data` | object; per key a scalar, a scalar array or `{or}` (any of), or `{and:[{or}]}` (every group); a nested object (one level) is a path. A key matches when its value equals a candidate, or for an array value when an element does; `null` matches a stored `null`, not a missing key. As upstream: keys must not be empty, start with `$` or `.`, or be `__proto__`/`constructor`/`prototype`; strings at most 256 chars; 100 values per group, 200 per filter (upstream: per key); other shapes 400. |
 | `PATCH /v1/inbox/notifications/:id/{read,unread,archive,unarchive}` | empty or `{}` body. `{data: InboxNotification}` (full object). |
-| `POST /v1/inbox/notifications/{read,seen,archive,read-archive}` | `{tags?, data?}` bulk, `data` is a `JSON.stringify`-ed object. `seen` also takes `notificationIds` (the SDK's single `seen(id)` uses it). `read-archive` archives the read ones. 204. |
+| `POST /v1/inbox/notifications/{read,seen,archive,read-archive}` | `{tags?, data?}` bulk, `data` is a `JSON.stringify`-ed object. `tags` takes the forms above. `seen` also takes `notificationIds` (the SDK's single `seen(id)` uses it); an empty list is a no-op, an absent one applies the filter. `read-archive` archives the read ones. 204. |
 | `GET /v1/inbox/preferences` | query `tags[]`, `severity[]`, `criticality` (`nonCritical` default, `critical`, `all`). `{data:[Preference]}`: one `level:"global"` then one `level:"template"` per workflow, oldest first. Global lists the channels the environment can deliver (`in_app`, plus `push`/`email` with an fcm/smtp integration). |
 | `PATCH /v1/inbox/preferences` and `/v1/inbox/preferences/:workflowId` | body is channel booleans, e.g. `{push:false}`; other keys (`schedule`, `enabled`) are ignored. `:workflowId` is the internal workflow id (what the SDK sends) or the identifier. `{data: Preference}`. Critical (read-only) workflows refuse with 400. |
 
@@ -239,13 +241,14 @@ archive, from either API) must publish through the `Hub`.
   step, skipped or disabled ones included (the framework throws on a missing one). Response
   `{outputs, providers, options:{skip}, metadata:{status, error, duration}}`.
 - `options.skip`, or empty `outputs` (the workflow function returned early), is a skip.
-- Timeout 5 s. Transient failure (network, 5xx, 429): retry with backoff, 3 attempts, then
-  the run fails and is kept for inspection in logs. 4xx: fail without retry.
+- Timeout 5 s. Transient failure (network, 5xx, 429): retry with backoff, 3 attempts; 4xx:
+  no retry. A `delay` or `digest` step that fails this way fails the run, kept for
+  inspection in logs; a failed channel step is logged and the run continues (as upstream).
 
 Step outputs: `in_app` `{subject?, body, avatar?, redirect?:{url,target?}, primaryAction?,
 secondaryAction?, data?}`; `push` `{subject, body}`; `email` `{subject, body}`; `digest`
 `{amount, unit, digestKey?}`; `delay` `{type:"regular", amount, unit}`. Only regular
-delays and digests are supported; timed, cron or dynamic ones fail the run, and so does a
+delays and digests are supported; timed, cron, dynamic or `lookBackWindow` ones fail the run, and so does a
 duration longer than 366 days, negative or not finite.
 
 State entries passed to later steps: `in_app` `{seen, read, lastSeenDate, lastReadDate}`
@@ -265,7 +268,7 @@ of payload, `eventCount` counts all of them. Skipped steps get the empty shape
 4. The runner walks steps in order. For each step: resolve preferences (below); if the
    channel is disabled, skip without calling the bridge; otherwise execute on the bridge and
    act on the result.
-5. `delay`: set `run_at = now + duration`, persist, return.
+5. `delay`: set `run_at = now + duration` (now read when the step runs), persist, return.
 6. `digest`: key is the `digestKey` output value itself (the code resolves it, as in
    Novu), absent means one group; scoped to workflow + subscriber + step. If an open digest run exists for that key, append this
    event to it and end this run (merged). Otherwise this run becomes the digest owner and
@@ -282,7 +285,9 @@ startup, runs left in progress are resumed. A run is executed by one worker at a
 Order, later wins: workflow defaults from code (`preferences.all`, `preferences.channels`)
 → subscriber global → subscriber per-workflow. A workflow whose preferences are read-only
 (`all.readOnly`) is critical: subscriber settings are ignored and it is hidden from
-`criticality=nonCritical` listings.
+`criticality=nonCritical` listings. Setting a channel globally removes it from all of that
+subscriber's per-workflow settings in the same transaction (as upstream), so the new global
+value applies everywhere.
 
 ### Delivery
 
@@ -290,10 +295,15 @@ Order, later wins: workflow defaults from code (`preferences.all`, `preferences.
 - `push`: FCM HTTP v1 for every device token of the subscriber under the matching
   integration. Tokens FCM reports as unregistered or invalid are deleted. Message carries
   `notification{title, body}` and the workflow payload as string `data`; honor
-  `providers.fcm` overrides returned by the bridge.
-- `email`: SMTP.
-- A delivery failure never blocks later steps of other runs; transient failures retry with
-  the run's backoff.
+  `providers.fcm` overrides returned by the bridge: `notification{title, body, image}`,
+  `data`, and `android`, `apns`, `webpush`, `fcmOptions` copied as given, so they must be in
+  the FCM HTTP v1 shape (no firebase-admin renames). `_passthrough.body` is merged last
+  without `token`, `tokens`, `topic` and `condition`: passthrough routing is not supported.
+- `email`: SMTP. The step's `from{email, name}` overrides the integration's `from` per
+  field; an empty `replyTo` is ignored. `Message-ID` is generated under the sender's domain.
+- A delivery failure never blocks other runs; transient failures retry with the run's
+  backoff. A permanent failure, or the last retry failing, skips that step with an empty
+  result and the run goes on to the next step.
 
 SMTP is `lettre` (rustls + ring). FCM uses no crate: the OAuth/FCM crates (`gcp_auth`,
 `yup-oauth2`) bring their own hyper client and TLS setup for two requests. The

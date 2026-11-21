@@ -226,6 +226,18 @@ pub struct SubscriberPatch {
     pub data: Option<Value>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SubscriberUpdate {
+    pub email: Option<Option<String>>,
+    pub first_name: Option<Option<String>>,
+    pub last_name: Option<Option<String>>,
+    pub phone: Option<Option<String>>,
+    pub avatar: Option<Option<String>>,
+    pub locale: Option<Option<String>>,
+    pub timezone: Option<Option<String>>,
+    pub data: Option<Option<Value>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Topic {
     pub id: Id,
@@ -320,12 +332,12 @@ pub enum Mark {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MessageFilter {
-    pub tags: Vec<String>,
+    pub tags: Vec<Vec<String>>,
     pub read: Option<bool>,
     pub seen: Option<bool>,
     pub archived: Option<bool>,
     pub snoozed: Option<bool>,
-    pub data: Option<Map<String, Value>>,
+    pub data: Vec<(Vec<String>, Vec<Value>)>,
     pub severity: Vec<Severity>,
 }
 

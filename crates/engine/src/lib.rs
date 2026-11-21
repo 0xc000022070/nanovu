@@ -22,6 +22,7 @@ pub enum Recipient {
     },
     Topic {
         key: String,
+        exclude: Vec<String>,
     },
 }
 
@@ -94,11 +95,11 @@ impl Engine {
                         .await?;
                     vec![subscriber_id.clone()]
                 }
-                Recipient::Topic { key } => store
+                Recipient::Topic { key, exclude } => store
                     .topic_subscriber_ids(&env.id, key, MAX_RECIPIENTS as u32 + 1)
                     .await?
                     .into_iter()
-                    .filter(|id| request.actor.as_ref() != Some(id))
+                    .filter(|id| request.actor.as_ref() != Some(id) && !exclude.contains(id))
                     .collect(),
             };
             for id in ids {
@@ -274,20 +275,17 @@ fn check_object(
     object: &Map<String, Value>,
     path: &str,
 ) -> Result<(), String> {
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let property = |key: &str| properties.and_then(|p| p.get(key));
     if let Some(Value::Array(required)) = schema.get("required")
-        && let Some(key) = required
-            .iter()
-            .filter_map(Value::as_str)
-            .find(|key| !object.contains_key(*key))
+        && let Some(key) = required.iter().filter_map(Value::as_str).find(|key| {
+            !object.contains_key(*key) && property(key).is_none_or(|s| s.get("default").is_none())
+        })
     {
         return Err(format!("{path} must have required property '{key}'"));
     }
-    let properties = schema.get("properties").and_then(Value::as_object);
     for (key, item) in object {
-        let item_schema = properties
-            .and_then(|p| p.get(key))
-            .or_else(|| schema.get("additionalProperties"));
-        if let Some(s) = item_schema {
+        if let Some(s) = property(key) {
             validate(s, item, &format!("{path}.{key}"))?;
         }
     }

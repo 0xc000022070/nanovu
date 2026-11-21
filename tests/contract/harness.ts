@@ -168,6 +168,7 @@ type FcmMessage = {
   token: unknown;
   notification: { title: unknown; body: unknown };
   data: { [key: string]: unknown };
+  android: unknown;
 };
 type FcmSend = { path: string; authorization?: string; message: FcmMessage };
 type TokenGrant = { form: { [key: string]: string }; claims: { [key: string]: unknown }; valid: boolean };
@@ -200,6 +201,7 @@ function googleFake(publicKey: KeyObject) {
         token: at(sent, "token"),
         notification: { title: at(sent, "notification", "title"), body: at(sent, "notification", "body") },
         data: record(at(sent, "data")),
+        android: at(sent, "android"),
       };
       sends.push({ path, authorization: req.headers.authorization, message });
       if (unregistered.has(message.token)) {

@@ -35,7 +35,7 @@ export const digest = workflow(
     await step.inApp("in-app", async () => ({ body: `${events.length} events` }));
     await step.push("push", async () => ({ subject: "Digest", body: `${events.length} events` }));
   },
-  { ...open, tags: ["Activity"] },
+  { tags: ["Activity"] },
 );
 
 export const delayed = workflow(
@@ -78,4 +78,19 @@ export const strict = workflow(
   { payloadSchema: z.object({ amount: z.number() }) },
 );
 
-export const workflows = [alert, digest, delayed, email, quiet, security, strict];
+export const sender = workflow("sender", async ({ step, payload }) => {
+  await step.email("email", async () => ({
+    subject: text(payload.title) ?? "",
+    body: `<p>${text(payload.body)}</p>`,
+    from: record(payload.from),
+    replyTo: "",
+  }));
+}, open);
+
+export const tuned = workflow("tuned", async ({ step, payload }) => {
+  await step.push("push", async () => push(payload), {
+    providers: { fcm: () => ({ android: { priority: "high" } }) },
+  });
+}, open);
+
+export const workflows = [alert, digest, delayed, email, quiet, security, strict, sender, tuned];

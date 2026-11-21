@@ -72,6 +72,44 @@ test("inbox: list filters by tags, read, archived and data", async () => {
   assert.equal(await count({ archived: false }), 2);
 });
 
+test("inbox: object tag filters on list, count and bulk", async () => {
+  const novu = await seed(sid(), [["alert"], ["alert"], ["security"]]);
+  const count = async (args: ListArgs) => (await list(novu, args)).notifications.length;
+  const either = { or: ["Activity", "Security"] };
+  const both = { and: [{ or: ["Activity", "Security"] }, { or: ["Activity"] }] };
+  assert.equal(await count({ tags: either }), 3);
+  assert.equal(await count({ tags: both }), 2);
+  assert.equal(await count({ tags: { and: [{ or: ["Activity"] }, { or: ["Security"] }] } }), 0);
+
+  const filters = [{ tags: either }, { tags: both, read: false }];
+  const { counts } = unwrap(await novu.notifications.count({ filters }));
+  const countOf = (filter: NotificationFilter) => counts.find((c) => isSameFilter(c.filter, filter))?.count;
+  assert.deepEqual(filters.map(countOf), [3, 2]);
+
+  unwrap(await novu.notifications.readAll({ tags: { and: [{ or: ["Security", "x"] }] } }));
+  assert.equal(await count({ read: true, tags: ["Security"] }), 1);
+  assert.equal(await count({ read: false }), 2);
+});
+
+test("inbox: data filters with nested paths, or, and and arrays", async () => {
+  const novu = await seed(sid(), [
+    ["alert", { kind: "a", meta: { team: "t1" }, labels: ["p", "q"] }],
+    ["alert", { kind: "b", meta: { team: "t2" } }],
+    ["alert", { kind: "c", flag: true }],
+  ]);
+  const kinds = async (data: ListArgs["data"]) =>
+    (await list(novu, { data })).notifications.map((n) => n.data?.kind).sort();
+  assert.deepEqual(await kinds({ meta: { team: "t2" } }), ["b"]);
+  assert.deepEqual(await kinds({ kind: { or: ["a", "c"] } }), ["a", "c"]);
+  assert.deepEqual(await kinds({ kind: { and: [{ or: ["a", "b"] }, { or: ["b", "c"] }] } }), ["b"]);
+  assert.deepEqual(await kinds({ labels: "q" }), ["a"]);
+  assert.deepEqual(await kinds({ flag: true, kind: ["c", "a"] }), ["c"]);
+
+  const filters = [{ data: { meta: { team: { or: ["t1", "t2"] } } } }];
+  const { counts } = unwrap(await novu.notifications.count({ filters }));
+  assert.equal(counts.find((c) => isSameFilter(c.filter, filters[0]))?.count, 2);
+});
+
 test("inbox: list paginates newest first with after", async () => {
   const novu = await seed(sid(), [["alert"], ["alert"], ["alert"]]);
   const page1 = await list(novu, { limit: 2 });
@@ -154,6 +192,12 @@ test("inbox: preferences list and update, critical workflow hidden or refused", 
   assert.equal(updated.channels.in_app, true);
   const again = unwrap(await novu.preferences.list()).find((p) => p.workflow?.identifier === "alert");
   assert.equal(again?.channels.push, false);
+
+  const global = unwrap(await novu.preferences.list()).find((p) => p.level === "global");
+  assert.ok(global, "global preference missing");
+  unwrap(await global.update({ channels: { push: true } }));
+  const reset = unwrap(await novu.preferences.list()).find((p) => p.workflow?.identifier === "alert");
+  assert.equal(reset?.channels.push, true);
 
   const all = unwrap(await novu.preferences.list({ criticality: WorkflowCriticalityEnum.ALL }));
   const critical = all.find((p) => p.workflow?.identifier === "security");

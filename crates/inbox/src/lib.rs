@@ -17,6 +17,9 @@ use serde_json::{Map, Value, json};
 
 const BODY_LIMIT: usize = 8 << 10;
 const MAX_COUNT_FILTERS: usize = 30;
+const MAX_GROUPS: usize = 30;
+const MAX_GROUP_VALUES: usize = 100;
+const MAX_FILTER_VALUES: usize = 200;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -229,8 +232,8 @@ fn filter_flag(raw: &Map<String, Value>, field: &str) -> Result<Option<bool>, Ht
     }
 }
 
-fn filter_strings(raw: &Map<String, Value>, field: &str) -> Result<Vec<String>, HttpError> {
-    match raw.get(field) {
+fn filter_strings(value: Option<&Value>, field: &str) -> Result<Vec<String>, HttpError> {
+    match value {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::String(s)) => Ok(vec![s.clone()]),
         Some(Value::Array(items)) => items
@@ -241,6 +244,108 @@ fn filter_strings(raw: &Map<String, Value>, field: &str) -> Result<Vec<String>, 
     }
 }
 
+fn or_groups(form: &Map<String, Value>) -> Option<Vec<Vec<Value>>> {
+    let group = |v: &Value| {
+        v.as_array()
+            .filter(|g| g.len() <= MAX_GROUP_VALUES)
+            .cloned()
+    };
+    match (form.len(), form.get("or"), form.get("and")) {
+        (1, Some(or), None) => Some(vec![group(or)?]),
+        (1, None, Some(Value::Array(and))) if and.len() <= MAX_GROUPS => and
+            .iter()
+            .map(|item| match item.as_object() {
+                Some(g) if g.len() == 1 => group(g.get("or")?).filter(|g| !g.is_empty()),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+fn tag_groups(value: Option<&Value>) -> Result<Vec<Vec<String>>, HttpError> {
+    let groups = match value {
+        Some(Value::Object(form)) => or_groups(form)
+            .ok_or_else(|| invalid("tags"))?
+            .iter()
+            .map(|g| filter_strings(Some(&Value::Array(g.clone())), "tags"))
+            .collect::<Result<Vec<_>, _>>()?,
+        other => vec![filter_strings(other, "tags")?],
+    };
+    if groups.len() > MAX_GROUPS
+        || groups.iter().any(|g| g.len() > MAX_GROUP_VALUES)
+        || groups.iter().map(Vec::len).sum::<usize>() > MAX_FILTER_VALUES
+    {
+        return Err(invalid("tags"));
+    }
+    Ok(groups.into_iter().filter(|g| !g.is_empty()).collect())
+}
+
+type DataFilter = Vec<(Vec<String>, Vec<Value>)>;
+
+fn data_filter(value: Option<&Value>) -> Result<DataFilter, HttpError> {
+    let mut out = Vec::new();
+    match value {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(data)) => data_entries(data, &[], &mut out)?,
+        Some(_) => return Err(invalid("data")),
+    }
+    if out.iter().map(|(_, g)| g.len()).sum::<usize>() > MAX_FILTER_VALUES {
+        return Err(invalid("data"));
+    }
+    Ok(out)
+}
+
+fn data_entries(
+    data: &Map<String, Value>,
+    prefix: &[String],
+    out: &mut DataFilter,
+) -> Result<(), HttpError> {
+    for (key, value) in data {
+        if key.is_empty()
+            || key.starts_with(['$', '.'])
+            || ["__proto__", "constructor", "prototype"].contains(&key.as_str())
+        {
+            return Err(invalid("data"));
+        }
+        let path = [prefix, std::slice::from_ref(key)].concat();
+        if let Value::Object(nested) = value
+            && prefix.is_empty()
+            && !is_data_form(nested)
+        {
+            data_entries(nested, &path, out)?;
+            continue;
+        }
+        for group in data_groups(value)? {
+            if !group.is_empty() {
+                out.push((path.clone(), group));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_data_form(value: &Map<String, Value>) -> bool {
+    value.contains_key("or") || value.contains_key("and")
+}
+
+fn data_groups(value: &Value) -> Result<Vec<Vec<Value>>, HttpError> {
+    let scalar = |v: &Value| match v {
+        Value::Array(_) | Value::Object(_) => false,
+        Value::String(s) => s.chars().count() <= 256,
+        _ => true,
+    };
+    match value {
+        Value::Object(form) if is_data_form(form) => or_groups(form),
+        Value::Object(_) => None,
+        Value::Array(values) if values.len() <= MAX_GROUP_VALUES => Some(vec![values.clone()]),
+        Value::Array(_) => None,
+        scalar => Some(vec![vec![scalar.clone()]]),
+    }
+    .filter(|groups| groups.iter().flatten().all(scalar))
+    .ok_or_else(|| invalid("data"))
+}
+
 fn parse_filter(raw: &Map<String, Value>) -> Result<MessageFilter, HttpError> {
     if raw.contains_key("createdGte") || raw.contains_key("createdLte") {
         return Err(HttpError::bad_request(
@@ -248,19 +353,14 @@ fn parse_filter(raw: &Map<String, Value>) -> Result<MessageFilter, HttpError> {
         ));
     }
     let flag = |field: &str| filter_flag(raw, field);
-    let strings = |field: &str| filter_strings(raw, field);
     Ok(MessageFilter {
-        tags: strings("tags")?,
+        tags: tag_groups(raw.get("tags"))?,
         read: flag("read")?,
         seen: flag("seen")?,
         archived: flag("archived")?,
         snoozed: flag("snoozed")?,
-        data: match raw.get("data") {
-            None | Some(Value::Null) => None,
-            Some(Value::Object(data)) => Some(data.clone()),
-            Some(_) => return Err(invalid("data")),
-        },
-        severity: strings("severity")?
+        data: data_filter(raw.get("data"))?,
+        severity: filter_strings(raw.get("severity"), "severity")?
             .iter()
             .map(|s| Severity::parse(s).ok_or_else(|| invalid("severity")))
             .collect::<Result<_, _>>()?,
@@ -305,6 +405,12 @@ fn list_query(query: Vec<(String, String)>) -> Result<(InboxPage, Map<String, Va
             _ => filter_param(&mut raw, key, value)?,
         }
     }
+    if let Some(Value::Array(groups)) = raw.get_mut("tags")
+        && groups.iter().any(Value::is_array)
+    {
+        let and = groups.drain(..).map(|or| json!({ "or": or })).collect();
+        raw.insert("tags".into(), json!({ "and": Value::Array(and) }));
+    }
     Ok((page, raw))
 }
 
@@ -316,6 +422,28 @@ fn filter_param(raw: &mut Map<String, Value>, key: String, value: String) -> Res
         if let Value::Array(items) = entry {
             items.push(Value::String(value));
         }
+    } else if let Some(index) = key
+        .strip_prefix("tags[")
+        .and_then(|k| k.strip_suffix("][]"))
+    {
+        let index: usize = index
+            .parse()
+            .ok()
+            .filter(|i| *i < MAX_GROUPS)
+            .ok_or_else(|| invalid("tags"))?;
+        let entry = raw
+            .entry("tags")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Value::Array(groups) = entry else {
+            return Err(invalid("tags"));
+        };
+        if groups.len() <= index {
+            groups.resize(index + 1, Value::Array(Vec::new()));
+        }
+        let Value::Array(group) = &mut groups[index] else {
+            return Err(invalid("tags"));
+        };
+        group.push(Value::String(value));
     } else if matches!(
         key.as_str(),
         "read" | "seen" | "archived" | "snoozed" | "data"
@@ -389,10 +517,8 @@ async fn mark_one(
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct BulkRequest {
-    #[serde(default)]
-    notification_ids: Vec<String>,
-    #[serde(default)]
-    tags: Vec<String>,
+    notification_ids: Option<Vec<String>>,
+    tags: Option<Value>,
     data: Option<String>,
 }
 
@@ -410,26 +536,11 @@ async fn mark_all(
         _ => return Err(HttpError::not_found("Not found")),
     };
     let body = body.unwrap_or_default();
-    if body.notification_ids.is_empty() {
-        let data = body
-            .data
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|_| HttpError::bad_request("Invalid data"))?;
-        let filter = MessageFilter {
-            tags: body.tags,
-            read,
-            data,
-            ..MessageFilter::default()
-        };
-        state
-            .store
-            .mark_inbox(&auth.env, &auth.subscriber_id, &filter, mark)
-            .await?;
-    } else {
-        let ids = body
-            .notification_ids
+    if let Some(ids) = body.notification_ids {
+        if ids.is_empty() {
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        let ids = ids
             .iter()
             .map(|id| {
                 Id::parse(id).ok_or_else(|| HttpError::bad_request("Invalid notificationIds"))
@@ -438,6 +549,23 @@ async fn mark_all(
         state
             .store
             .mark_messages(&auth.env, &auth.subscriber_id, &ids, mark)
+            .await?;
+    } else {
+        let data: Option<Value> = body
+            .data
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| invalid("data"))?;
+        let filter = MessageFilter {
+            tags: tag_groups(body.tags.as_ref())?,
+            read,
+            data: data_filter(data.as_ref())?,
+            ..MessageFilter::default()
+        };
+        state
+            .store
+            .mark_inbox(&auth.env, &auth.subscriber_id, &filter, mark)
             .await?;
     }
     auth.publish(&state);

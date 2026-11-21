@@ -59,7 +59,7 @@ pub(crate) async fn run_due(shared: &Arc<Shared>, now: i64) -> bool {
         let mut tasks = JoinSet::new();
         for run in runs {
             let shared = shared.clone();
-            tasks.spawn(async move { process(&shared, run, now).await });
+            tasks.spawn(async move { process(&shared, run).await });
         }
         while tasks.join_next().await.is_some() {}
     }
@@ -85,13 +85,13 @@ impl From<nanovu_core::StoreError> for Failure {
     }
 }
 
-async fn process(shared: &Shared, mut run: Run, now: i64) {
-    let error = match advance(shared, &mut run, now).await {
+async fn process(shared: &Shared, mut run: Run) {
+    let error = match advance(shared, &mut run).await {
         Ok(()) => return,
         Err(Failure::Retry(e)) if run.attempts + 1 < MAX_ATTEMPTS => {
             run.attempts += 1;
             run.status = RunStatus::Pending;
-            run.run_at = now + 10 * time::SECOND * 3_i64.pow(run.attempts);
+            run.run_at = time::now_ms() + 10 * time::SECOND * 3_i64.pow(run.attempts);
             tracing::warn!(run = %run.id, attempt = run.attempts, error = %e, "run step failed, retrying");
             None
         }
@@ -108,7 +108,7 @@ async fn process(shared: &Shared, mut run: Run, now: i64) {
     }
 }
 
-async fn advance(shared: &Shared, run: &mut Run, now: i64) -> Result<(), Failure> {
+async fn advance(shared: &Shared, run: &mut Run) -> Result<(), Failure> {
     let store = &shared.state.store;
     let env = shared
         .state
@@ -144,8 +144,11 @@ async fn advance(shared: &Shared, run: &mut Run, now: i64) -> Result<(), Failure
             .is_none_or(|c| channels.get(c) != Some(false));
         if !enabled || step.kind == StepKind::Unsupported {
             complete(run, step, Map::new());
-        } else if run_step(shared, env, run, &workflow, step, &subscriber, now).await? {
-            return Ok(());
+        } else {
+            let result = run_step(shared, env, run, &workflow, step, &subscriber).await;
+            if skip_failed_channel(run, step, result)? {
+                return Ok(());
+            }
         }
         run.attempts = 0;
         if !store.save_run(run).await? {
@@ -157,6 +160,22 @@ async fn advance(shared: &Shared, run: &mut Run, now: i64) -> Result<(), Failure
     Ok(())
 }
 
+fn skip_failed_channel(
+    run: &mut Run,
+    step: &WorkflowStep,
+    result: Result<bool, Failure>,
+) -> Result<bool, Failure> {
+    match result {
+        Err(Failure::Retry(e)) if run.attempts + 1 < MAX_ATTEMPTS => Err(Failure::Retry(e)),
+        Err(Failure::Retry(e) | Failure::Fail(e)) if step.kind.channel().is_some() => {
+            tracing::warn!(run = %run.id, workflow = %run.workflow_id, step = %step.step_id, error = %e, "channel step failed, continuing");
+            complete(run, step, Map::new());
+            Ok(false)
+        }
+        other => other,
+    }
+}
+
 async fn run_step(
     shared: &Shared,
     env: &Environment,
@@ -164,7 +183,6 @@ async fn run_step(
     workflow: &Workflow,
     step: &WorkflowStep,
     subscriber: &nanovu_core::domain::Subscriber,
-    now: i64,
 ) -> Result<bool, Failure> {
     if step.kind == StepKind::Digest && run.digest_key.is_some() {
         let (events, total) = shared
@@ -195,16 +213,9 @@ async fn run_step(
         complete(run, step, Map::new());
         return Ok(false);
     }
-    act(
-        shared, env, run, workflow, step, subscriber, &execution, now,
-    )
-    .await
+    act(shared, env, run, workflow, step, subscriber, &execution).await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the context `advance` loaded once per run"
-)]
 async fn act(
     shared: &Shared,
     env: &Environment,
@@ -213,7 +224,6 @@ async fn act(
     step: &WorkflowStep,
     subscriber: &nanovu_core::domain::Subscriber,
     execution: &Execution,
-    now: i64,
 ) -> Result<bool, Failure> {
     let outputs = &execution.outputs;
     match step.kind {
@@ -225,13 +235,18 @@ async fn act(
             let duration = duration(outputs)?;
             complete(run, step, as_map(json!({ "duration": duration })));
             run.status = RunStatus::Pending;
-            run.run_at = now + duration;
+            run.run_at = time::now_ms() + duration;
             run.attempts = 0;
             shared.state.store.save_run(run).await?;
             return Ok(true);
         }
         StepKind::Digest => {
-            let window_end = now + duration(outputs)?;
+            if outputs.get("lookBackWindow").is_some_and(|w| !w.is_null()) {
+                return Err(Failure::Fail(
+                    "only regular digests (amount, unit) are supported".into(),
+                ));
+            }
+            let window_end = time::now_ms() + duration(outputs)?;
             let key = outputs
                 .get("digestKey")
                 .map(|k| k.as_str().map_or_else(|| k.to_string(), str::to_owned))

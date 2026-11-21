@@ -9,7 +9,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePool, SqlitePoolOptions,
     SqliteRow, SqliteSynchronous,
@@ -19,7 +18,7 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use crate::domain::{
     Channel, ChannelPrefs, DigestEvent, DigestJoin, InboxPage, Mark, Message, MessageFilter,
     MessageQuery, Run, RunStatus, Severity, Subscriber, SubscriberPatch, SubscriberPreferences,
-    Topic, TopicMember, TopicSubscription, TopicSubscriptions, Workflow,
+    SubscriberUpdate, Topic, TopicMember, TopicSubscription, TopicSubscriptions, Workflow,
 };
 use crate::id::Id;
 use crate::store::{Result, Store, StoreError};
@@ -288,7 +287,7 @@ fn mark_assignments(mark: Mark, now: i64) -> String {
         Mark::Seen => seen,
         Mark::Read => format!("{seen}, {read}"),
         Mark::Archive => format!("{seen}, {read}, {archived}"),
-        Mark::Unseen => "seen_at = NULL, read_at = NULL, archived_at = NULL".to_owned(),
+        Mark::Unseen => "seen_at = NULL".to_owned(),
         Mark::Unread => format!("{seen}, read_at = NULL, archived_at = NULL"),
         Mark::Unarchive => format!("{seen}, {read}, archived_at = NULL"),
     };
@@ -305,9 +304,9 @@ fn push_nullness(qb: &mut QueryBuilder<Sqlite>, column: &str, set: Option<bool>)
 
 fn push_filter(qb: &mut QueryBuilder<Sqlite>, filter: &MessageFilter) -> Result<()> {
     qb.push(" AND channel = 'in_app'");
-    if !filter.tags.is_empty() {
+    for group in &filter.tags {
         qb.push(" AND EXISTS (SELECT 1 FROM json_each(messages.tags) t WHERE t.value IN (SELECT value FROM json_each(")
-            .push_bind(to_json(&filter.tags)?)
+            .push_bind(to_json(group)?)
             .push(")))");
     }
     push_nullness(qb, "read_at", filter.read);
@@ -322,20 +321,22 @@ fn push_filter(qb: &mut QueryBuilder<Sqlite>, filter: &MessageFilter) -> Result<
             .push_bind(to_json(&names)?)
             .push("))");
     }
-    for (key, value) in filter.data.iter().flatten() {
-        if key.contains('"') {
+    for (keys, candidates) in &filter.data {
+        if keys.iter().any(|key| key.contains('"')) {
             qb.push(" AND 0");
             continue;
         }
-        let candidates = match value {
-            Value::Array(_) => to_json(value)?,
-            other => to_json(&[other])?,
-        };
-        qb.push(" AND json_extract(messages.data, ")
-            .push_bind(format!("$.\"{key}\""))
-            .push(") IN (SELECT value FROM json_each(")
-            .push_bind(candidates)
-            .push("))");
+        let path: String = keys.iter().map(|key| format!(".\"{key}\"")).collect();
+        let path = format!("${path}");
+        // json_each yields the value at the path, or its elements when it is an array; an
+        // object would yield its members, hence the json_type guard. Types keep true apart from 1.
+        qb.push(" AND EXISTS (SELECT 1 FROM json_each(messages.data, ")
+            .push_bind(path.clone())
+            .push(") d, json_each(")
+            .push_bind(to_json(candidates)?)
+            .push(") c WHERE d.value IS c.value AND replace(d.type, 'real', 'integer') = replace(c.type, 'real', 'integer') AND json_type(messages.data, ")
+            .push_bind(path)
+            .push(") != 'object')");
     }
     Ok(())
 }
@@ -520,10 +521,49 @@ impl Store for SqliteStore {
         &self,
         env: &Id,
         subscriber_id: &str,
-        patch: &SubscriberPatch,
+        update: &SubscriberUpdate,
     ) -> Result<Option<Subscriber>> {
-        let mut conn = self.pool.acquire().await?;
-        patch_subscriber_in(&mut conn, env, subscriber_id, patch).await
+        fn text(v: &Option<Option<String>>) -> Option<&str> {
+            v.as_ref().and_then(Option::as_deref)
+        }
+        let data = update.data.as_ref().and_then(Option::as_ref);
+        sqlx::query(
+            "UPDATE subscribers SET
+               email = CASE WHEN ? THEN ? ELSE email END,
+               first_name = CASE WHEN ? THEN ? ELSE first_name END,
+               last_name = CASE WHEN ? THEN ? ELSE last_name END,
+               phone = CASE WHEN ? THEN ? ELSE phone END,
+               avatar = CASE WHEN ? THEN ? ELSE avatar END,
+               locale = CASE WHEN ? THEN ? ELSE locale END,
+               timezone = CASE WHEN ? THEN ? ELSE timezone END,
+               data = CASE WHEN ? THEN ? ELSE data END,
+               updated_at = ?
+             WHERE env_id = ? AND subscriber_id = ? RETURNING *",
+        )
+        .bind(update.email.is_some())
+        .bind(text(&update.email))
+        .bind(update.first_name.is_some())
+        .bind(text(&update.first_name))
+        .bind(update.last_name.is_some())
+        .bind(text(&update.last_name))
+        .bind(update.phone.is_some())
+        .bind(text(&update.phone))
+        .bind(update.avatar.is_some())
+        .bind(text(&update.avatar))
+        .bind(update.locale.is_some())
+        .bind(text(&update.locale))
+        .bind(update.timezone.is_some())
+        .bind(text(&update.timezone))
+        .bind(update.data.is_some())
+        .bind(data.map(to_json).transpose()?)
+        .bind(time::now_ms())
+        .bind(env.as_str())
+        .bind(subscriber_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(subscriber_from)
+        .transpose()
     }
 
     async fn subscriber(&self, env: &Id, subscriber_id: &str) -> Result<Option<Subscriber>> {
@@ -860,6 +900,23 @@ impl Store for SqliteStore {
             .transpose()?
             .unwrap_or_default();
         let merged = current.overlay(patch);
+        if workflow_id.is_empty() {
+            for channel in Channel::ALL {
+                if patch.get(channel).is_none() {
+                    continue;
+                }
+                sqlx::query(
+                    "UPDATE preferences SET channels = json_remove(channels, ?), updated_at = ?
+                     WHERE env_id = ? AND subscriber_id = ? AND workflow_id != ''",
+                )
+                .bind(format!("$.{}", channel.as_str()))
+                .bind(time::now_ms())
+                .bind(env.as_str())
+                .bind(subscriber_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         sqlx::query(
             "INSERT INTO preferences (env_id, subscriber_id, workflow_id, channels, updated_at) VALUES (?, ?, ?, ?, ?)
              ON CONFLICT (env_id, subscriber_id, workflow_id) DO UPDATE SET
@@ -1048,17 +1105,21 @@ impl Store for SqliteStore {
         &self,
         env: &Id,
         transaction_id: &str,
+        channel: Option<Channel>,
     ) -> Result<Vec<String>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let ids: Vec<String> = sqlx::query_scalar(
-            "DELETE FROM messages WHERE env_id = ? AND transaction_id = ? RETURNING subscriber_id",
+            "DELETE FROM messages WHERE env_id = ? AND transaction_id = ? AND (?3 IS NULL OR channel = ?3)
+             RETURNING subscriber_id",
         )
         .bind(env.as_str())
         .bind(transaction_id)
+        .bind(channel.map(Channel::as_str))
         .fetch_all(&mut *tx)
         .await?;
         sqlx::query(concat!(
-            "DELETE FROM runs WHERE env_id = ? AND transaction_id = ? AND ",
+            "DELETE FROM runs WHERE env_id = ?1 AND transaction_id = ?2 AND NOT EXISTS
+               (SELECT 1 FROM messages m WHERE m.env_id = ?1 AND m.transaction_id = ?2) AND ",
             released_run!()
         ))
         .bind(env.as_str())
@@ -1344,7 +1405,7 @@ impl Store for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::domain::{StepKind, WorkflowPreferences, WorkflowStep};
@@ -1450,9 +1511,27 @@ mod tests {
             (updated.email.as_deref(), updated.first_name.as_deref()),
             (Some("a@x"), Some("Ann"))
         );
+        let update = SubscriberUpdate {
+            email: Some(None),
+            last_name: Some(Some("Lee".into())),
+            ..Default::default()
+        };
+        let updated = store
+            .update_subscriber(&env, "a", &update)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                updated.email.as_deref(),
+                updated.first_name.as_deref(),
+                updated.last_name.as_deref()
+            ),
+            (None, Some("Ann"), Some("Lee"))
+        );
         assert!(
             store
-                .update_subscriber(&env, "zz", &patch)
+                .update_subscriber(&env, "zz", &update)
                 .await
                 .unwrap()
                 .is_none()
@@ -1691,6 +1770,36 @@ mod tests {
         let prefs = store.subscriber_preferences(&env, "a").await.unwrap();
         assert_eq!(prefs.global, merged);
         assert_eq!(prefs.workflows["wf"], on);
+
+        let both = ChannelPrefs {
+            email: Some(true),
+            push: Some(true),
+            ..Default::default()
+        };
+        store
+            .update_preferences(&env, "a", Some("wf"), &both)
+            .await
+            .unwrap();
+        store
+            .update_preferences(&env, "b", Some("wf"), &on)
+            .await
+            .unwrap();
+        let push_off = ChannelPrefs {
+            push: Some(false),
+            ..Default::default()
+        };
+        store
+            .update_preferences(&env, "a", None, &push_off)
+            .await
+            .unwrap();
+        let prefs = store.subscriber_preferences(&env, "a").await.unwrap();
+        assert_eq!(prefs.global.push, Some(false));
+        assert_eq!(
+            (prefs.workflows["wf"].email, prefs.workflows["wf"].push),
+            (Some(true), None)
+        );
+        let other = store.subscriber_preferences(&env, "b").await.unwrap();
+        assert_eq!(other.workflows["wf"], on);
     }
 
     #[tokio::test]
@@ -1698,9 +1807,15 @@ mod tests {
         let (store, env) = store().await;
         let mut ids = Vec::new();
         for (tags, data) in [
-            (vec!["a"], json!({ "kind": "x", "n": 1 })),
+            (
+                vec!["a"],
+                json!({ "kind": "x", "n": 1, "meta": { "team": "t1" }, "labels": ["p", "q"], "gone": null, "flag": true }),
+            ),
             (vec!["b"], json!({ "kind": "y" })),
-            (vec!["a", "b"], json!({ "kind": "x", "n": 2 })),
+            (
+                vec!["a", "b"],
+                json!({ "kind": "x", "n": 2, "meta": { "team": "t2" } }),
+            ),
         ] {
             let m = message("s", "tx", &tags, data);
             ids.push(m.id.clone());
@@ -1732,12 +1847,24 @@ mod tests {
         let (rest, more) = store.inbox(&env, "s", &all, &next).await.unwrap();
         assert_eq!((rest.len(), &rest[0].id, more), (1, &ids[0], false));
 
-        let tag_a = MessageFilter {
-            tags: vec!["a".into()],
+        let tags = |groups: &[&[&str]]| MessageFilter {
+            tags: groups
+                .iter()
+                .map(|g| g.iter().map(|t| (*t).to_owned()).collect())
+                .collect(),
             ..Default::default()
         };
-        let data = |v: Value| MessageFilter {
-            data: v.as_object().cloned(),
+        let tag_a = tags(&[&["a"]]);
+        let data = |clauses: &[(&[&str], Value)]| MessageFilter {
+            data: clauses
+                .iter()
+                .map(|(path, values)| {
+                    (
+                        path.iter().map(|k| (*k).to_owned()).collect(),
+                        values.as_array().unwrap().clone(),
+                    )
+                })
+                .collect(),
             ..Default::default()
         };
         let snoozed = MessageFilter {
@@ -1751,16 +1878,25 @@ mod tests {
         let filters = [
             all.clone(),
             tag_a.clone(),
-            data(json!({ "kind": "x" })),
-            data(json!({ "kind": ["y", "z"] })),
-            data(json!({ "n": 2 })),
-            data(json!({ "bad\"key": 1 })),
+            tags(&[&["a", "b"]]),
+            tags(&[&["a"], &["b", "z"]]),
+            data(&[(&["kind"], json!(["x"]))]),
+            data(&[(&["kind"], json!(["y", "z"]))]),
+            data(&[(&["kind"], json!(["x", "y"])), (&["n"], json!([2.0]))]),
+            data(&[(&["kind"], json!(["x", "y"])), (&["kind"], json!(["y"]))]),
+            data(&[(&["bad\"key"], json!([1]))]),
+            data(&[(&["meta", "team"], json!(["t1", "t3"]))]),
+            data(&[(&["meta"], json!(["t1"]))]),
+            data(&[(&["labels"], json!(["q"]))]),
+            data(&[(&["gone"], json!([null]))]),
+            data(&[(&["flag"], json!([true]))]),
+            data(&[(&["flag"], json!([1]))]),
             snoozed,
             high,
         ];
         assert_eq!(
             store.inbox_counts(&env, "s", &filters).await.unwrap(),
-            [3, 2, 2, 1, 1, 0, 0, 0]
+            [3, 2, 3, 1, 2, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0]
         );
 
         let read = store
@@ -1797,7 +1933,7 @@ mod tests {
             .mark_messages(&env, "s", &[ids[2].clone()], Mark::Unseen)
             .await
             .unwrap();
-        assert!(!cleared[0].is_seen() && !cleared[0].is_read());
+        assert!(!cleared[0].is_seen() && cleared[0].is_read());
 
         let query = MessageQuery {
             transaction_ids: vec!["tx".into()],
@@ -1805,7 +1941,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(store.messages(&env, &query).await.unwrap().0.len(), 5);
-        let affected = store.delete_transaction_messages(&env, "tx").await.unwrap();
+        let affected = store
+            .delete_transaction_messages(&env, "tx", None)
+            .await
+            .unwrap();
         assert_eq!(affected, ["other", "s"]);
     }
 
@@ -2046,7 +2185,10 @@ mod tests {
         assert!(store.save_run(&done).await.unwrap());
         assert_eq!(create(&run(&env, "s", "tx")).await.as_deref(), Some("tx"));
 
-        store.delete_transaction_messages(&env, "tx").await.unwrap();
+        store
+            .delete_transaction_messages(&env, "tx", None)
+            .await
+            .unwrap();
         assert_eq!(count(&store).await, 0);
         assert_eq!(create(&run(&env, "s", "tx")).await, None);
 
@@ -2059,5 +2201,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other.as_deref(), Some("tx2"));
+
+        let mut done = run(&env, "s", "tx3");
+        let created = store
+            .create_runs(&env, "tx3", None, std::slice::from_ref(&done))
+            .await
+            .unwrap();
+        assert_eq!(created, None);
+        done.status = RunStatus::Done;
+        assert!(store.save_run(&done).await.unwrap());
+        store
+            .insert_message(&env, &message("s", "tx3", &[], json!({})))
+            .await
+            .unwrap();
+        let push = store
+            .delete_transaction_messages(&env, "tx3", Some(Channel::Push))
+            .await
+            .unwrap();
+        assert!(push.is_empty());
+        assert_eq!(count(&store).await, 2);
+        let in_app = store
+            .delete_transaction_messages(&env, "tx3", Some(Channel::InApp))
+            .await
+            .unwrap();
+        assert_eq!(in_app, ["s"]);
+        assert_eq!(count(&store).await, 1);
     }
 }

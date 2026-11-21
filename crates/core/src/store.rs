@@ -3,9 +3,9 @@ use std::fmt;
 use async_trait::async_trait;
 
 use crate::domain::{
-    ChannelPrefs, DigestEvent, DigestJoin, InboxPage, Mark, Message, MessageFilter, MessageQuery,
-    Run, Subscriber, SubscriberPatch, SubscriberPreferences, Topic, TopicMember,
-    TopicSubscriptions, Workflow,
+    Channel, ChannelPrefs, DigestEvent, DigestJoin, InboxPage, Mark, Message, MessageFilter,
+    MessageQuery, Run, Subscriber, SubscriberPatch, SubscriberPreferences, SubscriberUpdate, Topic,
+    TopicMember, TopicSubscriptions, Workflow,
 };
 use crate::id::Id;
 
@@ -40,7 +40,7 @@ pub trait Store: Send + Sync {
         &self,
         env: &Id,
         subscriber_id: &str,
-        patch: &SubscriberPatch,
+        update: &SubscriberUpdate,
     ) -> Result<Option<Subscriber>>;
     async fn subscriber(&self, env: &Id, subscriber_id: &str) -> Result<Option<Subscriber>>;
     async fn delete_subscriber(&self, env: &Id, subscriber_id: &str) -> Result<bool>;
@@ -131,6 +131,7 @@ pub trait Store: Send + Sync {
         &self,
         env: &Id,
         transaction_id: &str,
+        channel: Option<Channel>,
     ) -> Result<Vec<String>>;
     async fn run_messages(&self, env: &Id, run_id: &Id) -> Result<Vec<Message>>;
 

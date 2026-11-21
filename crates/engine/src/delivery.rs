@@ -212,23 +212,37 @@ fn fcm_message(
         },
         "data": string_map(Some(payload)),
     });
-    if let Some(overrides) = overrides {
-        if let Some(Value::Object(n)) = overrides.get("notification") {
-            for key in ["title", "body", "image"] {
-                if let Some(v) = n.get(key) {
-                    message["notification"][key] = v.clone();
-                }
-            }
-        }
-        merge(
-            &mut message["data"],
-            &Value::Object(string_map(overrides.get("data"))),
-        );
-        if let Some(body) = overrides.pointer("/_passthrough/body") {
-            merge(&mut message, body);
-        }
+    let Some(overrides) = overrides else {
+        return message;
+    };
+    copy_keys(
+        &mut message["notification"],
+        overrides.get("notification"),
+        &["title", "body", "image"],
+    );
+    merge(
+        &mut message["data"],
+        &Value::Object(string_map(overrides.get("data"))),
+    );
+    copy_keys(
+        &mut message,
+        Some(overrides),
+        &["android", "apns", "webpush", "fcmOptions"],
+    );
+    if let Some(Value::Object(body)) = overrides.pointer("/_passthrough/body") {
+        let mut body = body.clone();
+        body.retain(|k, _| !["token", "topic", "condition", "tokens"].contains(&k.as_str()));
+        merge(&mut message, &Value::Object(body));
     }
     message
+}
+
+fn copy_keys(target: &mut Value, source: Option<&Value>, keys: &[&str]) {
+    for key in keys {
+        if let Some(v) = source.and_then(|s| s.get(key)) {
+            target[*key] = v.clone();
+        }
+    }
 }
 
 fn dead_token(body: &[u8]) -> bool {
@@ -374,7 +388,13 @@ async fn push(
     let mut transient = None;
     let unsent: Vec<String> = tokens.into_iter().filter(|t| !sent.contains(t)).collect();
     for token in &unsent {
-        let bearer = access_token(http, cache, key.clone(), &account).await?;
+        let bearer = match access_token(http, cache, key.clone(), &account).await {
+            Ok(bearer) => bearer,
+            Err(e) => {
+                transient = Some(e);
+                break;
+            }
+        };
         let message = fcm_message(
             token,
             &execution.outputs,
@@ -409,16 +429,15 @@ async fn email(
         return Ok(());
     };
     let text = |key: &str| outputs.get(key).and_then(Value::as_str);
-    let mailbox = |s: &str| {
-        s.parse::<Mailbox>()
-            .map_err(|e| CallError::Permanent(format!("email address {s}: {e}")))
-    };
+    let sender = sender(from, outputs)?;
+    let message_id = format!("<{}@{}>", Id::new(), sender.email.domain());
     let mut builder = lettre::Message::builder()
-        .from(mailbox(text("from").unwrap_or(from))?)
+        .from(sender)
+        .message_id(Some(message_id))
         .to(mailbox(to)?)
         .subject(text("subject").unwrap_or_default())
         .header(ContentType::TEXT_HTML);
-    if let Some(reply_to) = text("replyTo") {
+    if let Some(reply_to) = text("replyTo").map(str::trim).filter(|s| !s.is_empty()) {
         builder = builder.reply_to(mailbox(reply_to)?);
     }
     let message = builder
@@ -433,6 +452,26 @@ async fn email(
         Err(e) if e.is_permanent() => Err(CallError::Permanent(format!("smtp: {e}"))),
         Err(e) => Err(CallError::Transient(format!("smtp: {e}"))),
     }
+}
+
+fn mailbox(s: &str) -> Result<Mailbox, CallError> {
+    s.parse::<Mailbox>()
+        .map_err(|e| CallError::Permanent(format!("email address {s}: {e}")))
+}
+
+fn sender(from: &str, outputs: &Map<String, Value>) -> Result<Mailbox, CallError> {
+    let mut sender = mailbox(from)?;
+    let field = |key: &str| {
+        let value = outputs.get("from")?.get(key)?.as_str()?;
+        (!value.is_empty()).then_some(value)
+    };
+    if let Some(email) = field("email") {
+        sender.email = mailbox(email)?.email;
+    }
+    if let Some(name) = field("name") {
+        sender.name = Some(name.to_owned());
+    }
+    Ok(sender)
 }
 
 #[cfg(test)]
@@ -472,6 +511,11 @@ mod tests {
         let overrides = json!({
             "notification": {"title": "Over", "color": "#fff"},
             "data": {"extra": 1},
+            "android": {"priority": "normal", "ttl": "60s"},
+            "apns": {"payload": {"aps": {"sound": "default"}}},
+            "webpush": {"headers": {"Urgency": "high"}},
+            "fcmOptions": {"analyticsLabel": "a"},
+            "to": "legacy",
             "_passthrough": {"body": {"android": {"priority": "high"}}},
         });
         let message = fcm_message(
@@ -486,7 +530,27 @@ mod tests {
                 "token": "tok",
                 "notification": {"title": "Over", "body": "There"},
                 "data": {"n": "2", "s": "x", "extra": "1"},
-                "android": {"priority": "high"},
+                "android": {"priority": "high", "ttl": "60s"},
+                "apns": {"payload": {"aps": {"sound": "default"}}},
+                "webpush": {"headers": {"Urgency": "high"}},
+                "fcmOptions": {"analyticsLabel": "a"},
+            })
+        );
+    }
+
+    #[test]
+    fn fcm_passthrough_cannot_change_the_destination() {
+        let overrides = json!({"_passthrough": {"body": {
+            "token": "other", "tokens": ["a"], "topic": "news", "condition": "c", "collapseKey": "k",
+        }}});
+        let message = fcm_message("tok", &Map::new(), &json!({}), Some(&overrides));
+        assert_eq!(
+            message,
+            json!({
+                "token": "tok",
+                "notification": {"title": null, "body": null},
+                "data": {},
+                "collapseKey": "k",
             })
         );
     }

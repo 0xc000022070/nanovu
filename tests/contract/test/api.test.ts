@@ -50,6 +50,13 @@ test("api: subscriber create, patch and delete", async () => {
   assert.equal(patched.firstName, "Ada");
   assert.equal(patched.lastName, "Lovelace");
 
+  await ctx.api.subscribers.patch({ email: `${id}@contract.test` }, id);
+  const { result: cleared } = await ctx.api.subscribers.patch({ email: null }, id);
+  assert.equal(cleared.email, undefined);
+  assert.equal(cleared.lastName, "Lovelace");
+  const { result: read } = await ctx.api.subscribers.patch({ firstName: "Ada" }, id);
+  assert.equal(read.email, undefined);
+
   const { result: deleted } = await ctx.api.subscribers.delete(id);
   assert.deepEqual(deleted, { acknowledged: true, status: "deleted" });
 });
@@ -101,6 +108,18 @@ test("api: topics and subscriptions add and remove", async () => {
   assert.equal(removed.data.length, 1);
 });
 
+test("api: topic subscriptions where every entry fails answer 400", async () => {
+  const key = uid("topic");
+  await ctx.api.topics.create({ key, name: "Contract" });
+  const missing = sid();
+  const subscriptions = [{ identifier: `${key}:${missing}`, subscriberId: missing }];
+  for (const call of [ctx.api.topics.subscriptions.create, ctx.api.topics.subscriptions.delete]) {
+    const err = await expectError(call.call(ctx.api.topics.subscriptions, { subscriptions }, key), ErrorDto, 400);
+    assert.deepEqual(at(err.ctx, "meta"), { totalCount: 1, successful: 0, failed: 1 });
+    assert.equal(at(err.ctx, "errors", "0", "subscriberId"), missing);
+  }
+});
+
 test("api: framework workflow.trigger reaches one subscriber", async () => {
   const id = sid();
   const transactionId = uid("tx");
@@ -144,6 +163,28 @@ test("api: trigger to a topic excludes the actor", async () => {
   assert.deepEqual(await ctx.inAppMessages(actor, transactionId), []);
 });
 
+test("api: trigger to a topic honours exclude unless the subscriber is addressed directly", async () => {
+  const key = uid("topic");
+  const [a, b, c] = [sid(), sid(), sid()];
+  for (const subscriberId of [a, b, c]) await ctx.api.subscribers.create({ subscriberId });
+  await ctx.api.topics.subscriptions.create(
+    { subscriptions: [a, b, c].map((subscriberId) => ({ identifier: `${key}:${subscriberId}`, subscriberId })) },
+    key,
+  );
+  const excluded = uid("tx");
+  await ctx.api.trigger({ workflowId: "alert", to: { type: "Topic", topicKey: key, exclude: [b] }, payload: payload(), transactionId: excluded });
+  const direct = uid("tx");
+  await ctx.api.trigger({
+    workflowId: "alert",
+    to: [{ type: "Topic", topicKey: key, exclude: [c] }, c],
+    payload: payload(),
+    transactionId: direct,
+  });
+  await Promise.all([ctx.waitForInApp(a, excluded), ctx.waitForInApp(c, excluded), ctx.waitForInApp(c, direct)]);
+  await ctx.settle();
+  assert.deepEqual(await ctx.inAppMessages(b, excluded), []);
+});
+
 test("api: unknown workflow answers 422", async () => {
   await expectError(ctx.api.trigger({ workflowId: "nope", to: sid(), payload: {} }), ValidationErrorDto, 422);
 });
@@ -154,6 +195,14 @@ test("api: payload failing the workflow schema answers 400", async () => {
     PayloadValidationExceptionDto,
     400,
   );
+});
+
+test("api: a workflow without a payload schema accepts any payload", async () => {
+  const id = sid();
+  const transactionId = uid("tx");
+  const { result } = await ctx.api.trigger({ workflowId: "digest", to: id, payload: payload(), transactionId });
+  assert.equal(result.acknowledged, true);
+  await ctx.waitForInApp(id, transactionId);
 });
 
 test("api: idempotency-key replays the first trigger", async () => {
@@ -216,6 +265,18 @@ test("api: mark-as updates the message", async () => {
   assert.equal(unread[0].read, false);
 });
 
+test("api: unknown subscriber answers 404 on mark-as and messages list", async () => {
+  const id = sid();
+  const { message } = await deliver(id);
+  const other = sid();
+  await expectError(
+    ctx.api.subscribers.messages.markAllAs({ messageId: message.id, markAs: "read" }, other),
+    ErrorDto,
+    404,
+  );
+  await expectError(ctx.api.messages.retrieve({ subscriberId: other }), ErrorDto, 404);
+});
+
 test("api: messages list filters by transactionId", async () => {
   const id = sid();
   const one = await deliver(id);
@@ -232,4 +293,14 @@ test("api: delete by transactionId removes the messages", async () => {
   const { transactionId } = await deliver(id);
   await ctx.api.messages.deleteByTransactionId(transactionId);
   assert.deepEqual(await ctx.inAppMessages(id, transactionId), []);
+});
+
+test("api: delete by transactionId honours the channel", async () => {
+  const id = sid();
+  const { transactionId } = await deliver(id);
+  await ctx.api.messages.deleteByTransactionId(transactionId, "push");
+  assert.equal((await ctx.inAppMessages(id, transactionId)).length, 1);
+  await ctx.api.messages.deleteByTransactionId(transactionId, "in_app");
+  assert.deepEqual(await ctx.inAppMessages(id, transactionId), []);
+  await ctx.api.messages.deleteByTransactionId(uid("tx"), "in_app");
 });

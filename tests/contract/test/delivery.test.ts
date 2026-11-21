@@ -130,7 +130,34 @@ test("delivery: email reaches the SMTP sink", async () => {
   const mail = await waitFor(() => ctx.smtp.mails.find((m) => m.to.includes(address)), { what: "SMTP mail" });
   assert.equal(mail.from, "nanovu@contract.test");
   assert.match(mail.data, /^Subject: Hello\r?$/im);
+  assert.match(mail.data, /^Message-ID: <[^@\s]+@contract\.test>\r?$/im);
   assert.ok(mail.data.includes(body), "mail body carries the step body");
+});
+
+test("delivery: email from override falls back per field and empty replyTo is ignored", async () => {
+  const send = async (from: { email?: string; name?: string }) => {
+    const id = sid();
+    const address = `${id}@contract.test`;
+    await trigger("sender", { subscriberId: id, email: address }, { from });
+    return waitFor(() => ctx.smtp.mails.find((m) => m.to.includes(address)), { what: "SMTP mail" });
+  };
+  const full = await send({ email: "ops@override.test", name: "Ops" });
+  assert.equal(full.from, "ops@override.test");
+  assert.match(full.data, /^From: "?Ops"? <ops@override\.test>\r?$/im);
+  assert.match(full.data, /^Message-ID: <[^@\s]+@override\.test>\r?$/im);
+  assert.doesNotMatch(full.data, /^Reply-To:/im);
+  const named = await send({ name: "Ops" });
+  assert.equal(named.from, "nanovu@contract.test");
+  assert.match(named.data, /^From: "?Ops"? <nanovu@contract\.test>\r?$/im);
+});
+
+test("delivery: providers.fcm android override reaches FCM", async () => {
+  const id = sid();
+  const token = await withToken(id);
+  const { body } = await trigger("tuned", id);
+  const sent = await waitForPush(body);
+  assert.equal(sent.message.token, token);
+  assert.deepEqual(sent.message.android, { priority: "high" });
 });
 
 test("delivery: early return produces nothing", async () => {

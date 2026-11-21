@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Router;
@@ -32,7 +33,65 @@ struct Fake {
     calls: Mutex<Vec<Call>>,
     fcm: Mutex<Vec<(String, String, Value)>>,
     access_tokens: Mutex<u32>,
+    grant_down: AtomicBool,
     gate: tokio::sync::RwLock<()>,
+}
+
+fn grant_token(fake: &Fake, body: &[u8]) -> Value {
+    let form = std::str::from_utf8(body).expect("the token request is a UTF-8 form");
+    let jwt = form
+        .split_once("&assertion=")
+        .expect("the token request carries an assertion")
+        .1;
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.validate_aud = false;
+    let public = jsonwebtoken::DecodingKey::from_rsa_pem(service_key().1.as_bytes())
+        .expect("the generated public key is valid PEM");
+    let claims = jsonwebtoken::decode::<Value>(jwt, &public, &validation)
+        .expect("the engine signs with the service account key")
+        .claims;
+    assert_eq!(
+        claims["scope"],
+        "https://www.googleapis.com/auth/firebase.messaging"
+    );
+    assert_eq!(claims["iss"], "nanovu@test.iam.gserviceaccount.com");
+    let mut issued = fake
+        .access_tokens
+        .lock()
+        .expect("no test panics while holding the access token lock");
+    *issued += 1;
+    json!({"access_token": format!("fake-access-{issued}"), "expires_in": 3600})
+}
+
+fn fcm_reply(fake: &Fake, token: &Value, auth: &str, first_flaky: bool) -> (u16, Value) {
+    if first_flaky {
+        return (
+            503,
+            json!({"error": {"code": 503, "status": "UNAVAILABLE"}}),
+        );
+    }
+    if (token == "stale-auth" || token == "revoked") && auth == "Bearer fake-access-1" {
+        if token == "revoked" {
+            fake.grant_down.store(true, Ordering::SeqCst);
+        }
+        return (
+            401,
+            json!({"error": {"code": 401, "status": "UNAUTHENTICATED"}}),
+        );
+    }
+    if token == "dead" || token == "dead-verbose" {
+        let detail = json!({"@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError", "errorCode": "UNREGISTERED"});
+        let message = if token == "dead" {
+            String::new()
+        } else {
+            "x".repeat(4096)
+        };
+        return (
+            404,
+            json!({"error": {"code": 404, "message": message, "status": "NOT_FOUND", "details": [detail]}}),
+        );
+    }
+    (200, json!({"name": "projects/p/messages/1"}))
 }
 
 async fn fake_handler(
@@ -79,34 +138,10 @@ async fn fake_handler(
             let _open = fake.gate.read().await;
             reply(status, value)
         }
-        (Method::POST, "/token") => {
-            let form = String::from_utf8(body.to_vec()).expect("the token request is a UTF-8 form");
-            let jwt = form
-                .split_once("&assertion=")
-                .expect("the token request carries an assertion")
-                .1;
-            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-            validation.validate_aud = false;
-            let public = jsonwebtoken::DecodingKey::from_rsa_pem(service_key().1.as_bytes())
-                .expect("the generated public key is valid PEM");
-            let claims = jsonwebtoken::decode::<Value>(jwt, &public, &validation)
-                .expect("the engine signs with the service account key")
-                .claims;
-            assert_eq!(
-                claims["scope"],
-                "https://www.googleapis.com/auth/firebase.messaging"
-            );
-            assert_eq!(claims["iss"], "nanovu@test.iam.gserviceaccount.com");
-            let mut issued = fake
-                .access_tokens
-                .lock()
-                .expect("no test panics while holding the access token lock");
-            *issued += 1;
-            reply(
-                200,
-                json!({"access_token": format!("fake-access-{issued}"), "expires_in": 3600}),
-            )
+        (Method::POST, "/token") if fake.grant_down.swap(false, Ordering::SeqCst) => {
+            reply(503, json!({"error": "unavailable"}))
         }
+        (Method::POST, "/token") => reply(200, grant_token(&fake, &body)),
         (Method::POST, path) if path.ends_with("/v1/projects/p/messages:send") => {
             let auth = headers["authorization"]
                 .to_str()
@@ -123,30 +158,8 @@ async fn fake_handler(
                 token == "flaky" && !sent.iter().any(|(_, _, m)| m["message"]["token"] == token);
             sent.push((path.to_owned(), auth.clone(), parsed));
             drop(sent);
-            if first_flaky {
-                reply(
-                    503,
-                    json!({"error": {"code": 503, "status": "UNAVAILABLE"}}),
-                )
-            } else if token == "stale-auth" && auth == "Bearer fake-access-1" {
-                reply(
-                    401,
-                    json!({"error": {"code": 401, "status": "UNAUTHENTICATED"}}),
-                )
-            } else if token == "dead" || token == "dead-verbose" {
-                let detail = json!({"@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError", "errorCode": "UNREGISTERED"});
-                let message = if token == "dead" {
-                    String::new()
-                } else {
-                    "x".repeat(4096)
-                };
-                reply(
-                    404,
-                    json!({"error": {"code": 404, "message": message, "status": "NOT_FOUND", "details": [detail]}}),
-                )
-            } else {
-                reply(200, json!({"name": "projects/p/messages/1"}))
-            }
+            let (status, value) = fcm_reply(&fake, &token, &auth, first_flaky);
+            reply(status, value)
         }
         _ => reply(404, json!({})),
     }
@@ -203,6 +216,7 @@ impl Harness {
             calls: Mutex::default(),
             fcm: Mutex::default(),
             access_tokens: Mutex::default(),
+            grant_down: AtomicBool::default(),
             gate: tokio::sync::RwLock::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -404,7 +418,10 @@ async fn topics_dedup_and_exclude_the_actor_only_from_expansion() {
         subscriber_id: id.into(),
         patch: Box::default(),
     };
-    let topic = Recipient::Topic { key: "team".into() };
+    let topic = Recipient::Topic {
+        key: "team".into(),
+        exclude: vec![],
+    };
 
     h.engine
         .trigger(
@@ -433,6 +450,25 @@ async fn topics_dedup_and_exclude_the_actor_only_from_expansion() {
         .map(|r| r.subscriber_id)
         .collect();
     assert_eq!(ids, ["actor"]);
+
+    let without_b = Recipient::Topic {
+        key: "team".into(),
+        exclude: vec!["b".into()],
+    };
+    for (to, expected) in [
+        (vec![without_b.clone()], vec!["a"]),
+        (vec![without_b, subscriber("b")], vec!["a", "b"]),
+    ] {
+        h.engine.trigger(h.env(), request(to)).await.unwrap();
+        let mut ids: Vec<String> = h
+            .drain(time::now_ms())
+            .await
+            .into_iter()
+            .map(|r| r.subscriber_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, expected);
+    }
 }
 
 #[tokio::test]
@@ -832,6 +868,38 @@ async fn fcm_401_refreshes_the_access_token_and_retries() {
 }
 
 #[tokio::test]
+async fn failed_token_grant_keeps_the_tokens_already_sent() {
+    let respond = |_: &str, _: &Value| (200, json!({"outputs": {"subject": "T", "body": "B"}}));
+    let h = Harness::new(steps(r#"[{"stepId": "p", "type": "push"}]"#), respond).await;
+    let env = &h.env().id;
+    h.state
+        .store
+        .upsert_subscriber(env, "s1", &SubscriberPatch::default())
+        .await
+        .unwrap();
+    let tokens = ["a".to_owned(), "revoked".to_owned(), "z".to_owned()];
+    h.state
+        .store
+        .set_device_tokens(env, "s1", "push", &tokens)
+        .await
+        .unwrap();
+    h.trigger(&["s1"], json!({}), None).await;
+    let now = time::now_ms();
+    h.tick(now).await;
+    h.tick(now + time::MINUTE).await;
+    let sent: Vec<String> = h
+        .fake
+        .fcm
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, _, m)| m["message"]["token"].to_string())
+        .collect();
+    assert_eq!(sent, [r#""a""#, r#""revoked""#, r#""revoked""#, r#""z""#]);
+    assert!(h.drain(now + time::HOUR).await.is_empty());
+}
+
+#[tokio::test]
 async fn idempotent_trigger_returns_the_first_transaction() {
     let h = Harness::new(steps(IN_APP), in_app).await;
     let request = TriggerRequest {
@@ -906,7 +974,10 @@ async fn a_trigger_reaching_too_many_subscribers_stores_nothing() {
     store.subscribe_topic(env, "all", &members).await.unwrap();
     let request = TriggerRequest {
         workflow_id: "wf".into(),
-        to: vec![Recipient::Topic { key: "all".into() }],
+        to: vec![Recipient::Topic {
+            key: "all".into(),
+            exclude: vec![],
+        }],
         payload: json!({}),
         transaction_id: None,
         actor: None,
@@ -957,14 +1028,90 @@ async fn digests_hand_over_a_bounded_event_list_and_the_full_count() {
     assert_eq!(events[0]["payload"], json!({"n": 0}));
 }
 
+#[tokio::test]
+async fn delays_count_from_the_moment_the_step_runs() {
+    let respond = |_: &str, _: &Value| {
+        (
+            200,
+            json!({"outputs": {"type": "regular", "amount": 30, "unit": "seconds"}}),
+        )
+    };
+    let h = Harness::new(steps(r#"[{"stepId": "d", "type": "delay"}]"#), respond).await;
+    h.trigger(&["s1"], json!({}), None).await;
+    let stale = time::now_ms();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    h.tick(stale).await;
+    assert!(h.drain(stale + 30 * time::SECOND).await.is_empty());
+    assert_eq!(h.drain(time::now_ms() + 30 * time::SECOND).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_channel_step_does_not_stop_later_steps() {
+    for status in [400, 503] {
+        let respond = move |step: &str, body: &Value| match step {
+            "e" => (status, json!({"message": "bad"})),
+            _ => in_app(step, body),
+        };
+        let h = Harness::new(
+            steps(r#"[{"stepId": "e", "type": "email"}, {"stepId": "a", "type": "in_app"}]"#),
+            respond,
+        )
+        .await;
+        let env = &h.env().id;
+        let prefs = ChannelPrefs {
+            email: Some(true),
+            ..Default::default()
+        };
+        h.state
+            .store
+            .upsert_subscriber(env, "s1", &SubscriberPatch::default())
+            .await
+            .unwrap();
+        h.state
+            .store
+            .update_preferences(env, "s1", Some("wf"), &prefs)
+            .await
+            .unwrap();
+        h.trigger(&["s1"], json!({}), None).await;
+        let now = time::now_ms();
+        for hours in 0..3 {
+            h.tick(now + hours * time::HOUR).await;
+        }
+        assert_eq!(h.calls("e").len(), if status == 400 { 1 } else { 3 });
+        assert_eq!(h.messages("s1").await.len(), 1, "{status}");
+    }
+}
+
+#[tokio::test]
+async fn look_back_digests_fail_the_run() {
+    let respond = |step: &str, body: &Value| match step {
+        "g" => (
+            200,
+            json!({"outputs": {"amount": 5, "unit": "minutes", "lookBackWindow": {"amount": 1, "unit": "hours"}}}),
+        ),
+        _ => in_app(step, body),
+    };
+    let h = Harness::new(
+        steps(r#"[{"stepId": "g", "type": "digest"}, {"stepId": "a", "type": "in_app"}]"#),
+        respond,
+    )
+    .await;
+    h.trigger(&["s1"], json!({}), None).await;
+    h.tick(time::now_ms()).await;
+    assert_eq!(h.calls("g").len(), 1);
+    assert!(h.drain(i64::MAX).await.is_empty());
+    assert!(h.calls("a").is_empty());
+}
+
 #[test]
 fn schema_subset() {
     let schema = json!({
         "type": "object",
-        "required": ["id"],
+        "required": ["id", "mode"],
         "additionalProperties": false,
         "properties": {
             "id": {"type": "integer", "minimum": 1},
+            "mode": {"type": "string", "default": "x"},
             "kind": {"enum": ["a", "b"]},
             "note": {"type": ["string", "null"], "maxLength": 3},
             "items": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"const": 1}]}},
@@ -973,7 +1120,7 @@ fn schema_subset() {
     assert!(
         validate(
             &schema,
-            &json!({"id": 1, "kind": "a", "note": null, "items": ["x", 1]}),
+            &json!({"id": 1, "kind": "a", "note": null, "items": ["x", 1], "extra": true}),
             "payload"
         )
         .is_ok()
@@ -985,7 +1132,7 @@ fn schema_subset() {
         json!({"id": 1, "kind": "c"}),
         json!({"id": 1, "note": "long"}),
         json!({"id": 1, "items": [2]}),
-        json!({"id": 1, "extra": true}),
+        json!({"id": 1, "mode": 2}),
     ] {
         assert!(validate(&schema, &bad, "payload").is_err(), "{bad}");
     }

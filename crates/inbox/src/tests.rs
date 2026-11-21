@@ -330,6 +330,15 @@ async fn lists_with_filters_and_cursor() {
             vec![old_id.as_str()],
         ),
         ("snoozed=true", vec![]),
+        (
+            "tags[0][]=Activity&tags[0][]=Other&tags[1][]=Activity",
+            vec![archived_id.as_str(), old_id.as_str()],
+        ),
+        ("tags[0][]=Activity&tags[1][]=Other", vec![]),
+        (
+            "data=%7B%22kind%22%3A%7B%22or%22%3A%5B%22invite%22%2C%22x%22%5D%7D%7D",
+            vec![old_id.as_str()],
+        ),
     ];
     for (query, expected) in cases {
         let (status, page) = call(
@@ -352,6 +361,17 @@ async fn lists_with_filters_and_cursor() {
     assert_eq!(
         page["filter"],
         json!({"archived": false, "tags": ["Activity"]})
+    );
+    let (_, page) = call(
+        &state,
+        "GET",
+        "/v1/inbox/notifications?tags[1][]=b&tags[0][]=a",
+        None,
+    )
+    .await;
+    assert_eq!(
+        page["filter"],
+        json!({"tags": {"and": [{"or": ["a"]}, {"or": ["b"]}]}})
     );
 
     let (_, page) = call(&state, "GET", "/v1/inbox/notifications?limit=1", None).await;
@@ -379,6 +399,9 @@ async fn lists_with_filters_and_cursor() {
         "after=nope",
         "severity=urgent",
         "createdGte=1",
+        "tags[30][]=a",
+        "tags[]=a&tags[0][]=b",
+        "data=%7B%22%24where%22%3A1%7D",
     ] {
         let (status, _) = call(
             &state,
@@ -421,7 +444,22 @@ async fn count_echoes_filters() {
     let (status, _) = call(&state, "GET", &uri(long), None).await;
     assert_eq!(status, 414);
 
-    let filters = json!([{"seen": false, "tags": ["Activity"]}, {"read": false}, {"severity": ["high"], "archived": true}]);
+    for bad in [
+        json!([{"tags": {"or": "x"}}]),
+        json!([{"tags": {"and": [{"or": []}]}}]),
+        json!([{"data": {"a": {"b": {"c": 1}}}}]),
+    ] {
+        let (status, _) = call(&state, "GET", &uri(bad.clone()), None).await;
+        assert_eq!(status, 400, "{bad}");
+    }
+
+    let filters = json!([
+        {"seen": false, "tags": ["Activity"]},
+        {"read": false},
+        {"severity": ["high"], "archived": true},
+        {"tags": {"or": ["Activity", "Other"]}},
+        {"tags": {"and": [{"or": ["Activity"]}, {"or": ["Other"]}]}},
+    ]);
     let (status, response) = call(&state, "GET", &uri(filters), None).await;
     assert_eq!(status, 200);
     assert_eq!(
@@ -430,6 +468,8 @@ async fn count_echoes_filters() {
             {"count": 1, "filter": {"seen": false, "tags": ["Activity"]}},
             {"count": 2, "filter": {"read": false}},
             {"count": 0, "filter": {"severity": ["high"], "archived": true}},
+            {"count": 2, "filter": {"tags": {"or": ["Activity", "Other"]}}},
+            {"count": 0, "filter": {"tags": {"and": [{"or": ["Activity"]}, {"or": ["Other"]}]}}},
         ]})
     );
 }
@@ -440,8 +480,10 @@ async fn marks_respond_and_publish() {
     let mut events = state.hub.subscribe(&env(&state).id, SUB).unwrap();
     let a = message(&["Activity"], Severity::None);
     let b = message(&["Other"], Severity::None);
+    let c = message(&["Activity"], Severity::None);
     insert(&state, &a).await;
     insert(&state, &b).await;
+    insert(&state, &c).await;
 
     let (status, response) = call(
         &state,
@@ -487,6 +529,17 @@ async fn marks_respond_and_publish() {
     .await;
     assert_eq!(status, 404);
 
+    let none = json!({"notificationIds": []});
+    let (status, _) = call(&state, "POST", "/v1/inbox/notifications/seen", Some(none)).await;
+    assert_eq!(status, 204);
+    let stored = state
+        .store
+        .message(&env(&state).id, SUB, &c.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!stored.is_seen());
+
     let seen = json!({"notificationIds": [b.id.to_string()]});
     let (status, _) = call(&state, "POST", "/v1/inbox/notifications/seen", Some(seen)).await;
     assert_eq!(status, 204);
@@ -503,7 +556,7 @@ async fn marks_respond_and_publish() {
         &state,
         "POST",
         "/v1/inbox/notifications/read",
-        Some(json!({"tags": ["Other"], "data": "{}"})),
+        Some(json!({"tags": {"and": [{"or": ["Other", "x"]}]}, "data": "{}"})),
     )
     .await;
     assert_eq!(status, 204);
@@ -515,6 +568,13 @@ async fn marks_respond_and_publish() {
         .unwrap()
         .unwrap();
     assert!(stored.is_read() && !stored.is_archived());
+    let untouched = state
+        .store
+        .message(&env(&state).id, SUB, &c.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!untouched.is_read());
 
     let (status, _) = call(
         &state,
